@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const compression = require('compression');
 const { MongoClient, ObjectId } = require('mongodb');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -12,6 +13,7 @@ const DB_NAME = process.env.DB_NAME || 'chronicle_mag';
 const JWT_SECRET = process.env.JWT_SECRET || 'chronicle_editorial_secret_jwt_key_2026';
 
 // Middleware
+app.use(compression());
 app.use(cors({
   origin: process.env.CORS_ORIGIN || '*',
   credentials: true
@@ -468,10 +470,28 @@ app.get('/api/stories', async (req, res) => {
     }
 
     const stories = await storiesCollection
-      .find(filter)
+      .find(filter, {
+        projection: {
+          title: 1,
+          slug: 1,
+          category: 1,
+          coverImage: 1,
+          summary: 1,
+          author: 1,
+          readingTime: 1,
+          featured: 1,
+          views: 1,
+          likes: 1,
+          createdAt: 1,
+          updatedAt: 1
+        }
+      })
       .sort(sortOption)
       .limit(parseInt(limit, 10))
       .toArray();
+
+    // Browser caching: 30s fresh, 120s stale-while-revalidate for instant back/forward navigation
+    res.set('Cache-Control', 'public, max-age=30, stale-while-revalidate=120');
 
     res.json({
       success: true,
@@ -513,6 +533,9 @@ app.get('/api/categories', async (req, res) => {
       count: countMap[cat.name.toLowerCase()] || 0,
       createdAt: cat.createdAt
     }));
+
+    // Cache categories for 120s fresh, 600s stale-while-revalidate
+    res.set('Cache-Control', 'public, max-age=120, stale-while-revalidate=600');
 
     res.json({
       success: true,
