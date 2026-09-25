@@ -7,18 +7,115 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const app = express();
+app.disable('x-powered-by');
+
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/chronicle_mag';
 const DB_NAME = process.env.DB_NAME || 'chronicle_mag';
 const JWT_SECRET = process.env.JWT_SECRET || 'chronicle_editorial_secret_jwt_key_2026';
 
+// Strict CORS Origin Allowlist (No Wildcard *)
+const ALLOWED_ORIGINS = new Set([
+  'https://chronicle-magazine.vercel.app',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  ...(process.env.CORS_ORIGIN
+    ? process.env.CORS_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean)
+    : []),
+  ...(process.env.NEXT_PUBLIC_SITE_URL ? [process.env.NEXT_PUBLIC_SITE_URL.trim()] : []),
+]);
+
+// Helper to validate external HTTPS URLs and prevent SSRF against internal/private networks
+function isSafeExternalHttpsUrl(urlStr) {
+  if (!urlStr || typeof urlStr !== 'string') return false;
+  try {
+    const parsed = new URL(urlStr.trim());
+    if (parsed.protocol !== 'https:') return false;
+    const host = parsed.hostname.toLowerCase();
+    // Block loopback, link-local metadata (169.254.169.254), and private RFC1918 ranges
+    if (
+      host === 'localhost' ||
+      host.endsWith('.local') ||
+      host.endsWith('.internal') ||
+      host === '[::1]' ||
+      /^127\./.test(host) ||
+      /^10\./.test(host) ||
+      /^192\.168\./.test(host) ||
+      /^169\.254\./.test(host) ||
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host) ||
+      /^0\./.test(host)
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const SSRF_PAYLOAD_REGEX = /169\.254\.169\.254|metadata\.google\.internal|file:\/\/|gopher:\/\/|dict:\/\//i;
+
 // Middleware
 app.use(compression());
-app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*',
-  credentials: true
-}));
-app.use(express.json());
+
+// Security Headers & Strict Cross-Origin Enforcement
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains; preload');
+  res.setHeader('Vary', 'Origin');
+
+  const origin = req.headers.origin;
+  if (origin && !ALLOWED_ORIGINS.has(origin)) {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden: Origin not permitted by CORS policy.'
+    });
+  }
+
+  // Inspect raw URL / query string for cloud metadata SSRF probes
+  if (SSRF_PAYLOAD_REGEX.test(decodeURIComponent(req.originalUrl || ''))) {
+    return res.status(400).json({
+      success: false,
+      error: 'Bad Request: Disallowed internal network target.'
+    });
+  }
+
+  next();
+});
+
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin || ALLOWED_ORIGINS.has(origin)) {
+        return callback(null, origin || 'https://chronicle-magazine.vercel.app'|| 'http://localhost:3000');
+      }
+      return callback(null, false);
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+  })
+);
+
+app.use(express.json({ limit: '250kb' }));
+
+// Inspect JSON request bodies for SSRF metadata probes
+app.use((req, res, next) => {
+  if (req.body && typeof req.body === 'object') {
+    const serialized = JSON.stringify(req.body);
+    if (SSRF_PAYLOAD_REGEX.test(serialized)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Bad Request: Disallowed internal network address in payload.'
+      });
+    }
+  }
+  next();
+});
 
 // MongoDB Client & Collections references
 let client;
@@ -31,10 +128,11 @@ let categoriesCollection;
 
 // Helper to convert id string to MongoDB query (ObjectId or slug)
 function buildStoryQuery(idOrSlug) {
-  if (ObjectId.isValid(idOrSlug) && String(new ObjectId(idOrSlug)) === idOrSlug) {
-    return { $or: [{ _id: new ObjectId(idOrSlug) }, { slug: idOrSlug }] };
+  const safeId = String(idOrSlug || '').trim();
+  if (ObjectId.isValid(safeId) && String(new ObjectId(safeId)) === safeId) {
+    return { $or: [{ _id: new ObjectId(safeId) }, { slug: safeId }] };
   }
-  return { slug: idOrSlug };
+  return { slug: safeId };
 }
 
 // User Authentication Middleware
@@ -344,7 +442,9 @@ Leonardo believed that sight was the highest sense and that true knowledge deriv
 
 His codices—thousands of mirror-written pages filled with sketches of helicopters, parachutes, automated looms, and perpetual motion machines—remain one of the most awe-inspiring records of human imagination in world history.`,
     createdAt: new Date('2026-02-20T11:00:00Z'),
-    updatedAt: new Date('2026-02-20T11:00:00Z')
+    updatedAt: new Date('https://chronicle-magazine.vercel.app',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000','2026-02-20T11:00:00Z')
   }
 ];
 
@@ -1300,6 +1400,13 @@ app.post('/api/stories', verifyAdminToken, async (req, res) => {
       });
     }
 
+    if (coverImage && !isSafeExternalHttpsUrl(coverImage)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Cover image must be a valid external HTTPS URL.'
+      });
+    }
+
     const newStory = {
       title: title.trim(),
       slug: cleanSlug,
@@ -1364,6 +1471,20 @@ app.put('/api/stories/:id', verifyAdminToken, async (req, res) => {
 
     const updateFields = { ...req.body };
     delete updateFields._id; // Never overwrite MongoDB _id
+    // Strip any MongoDB operator keys ($) to prevent operator injection
+    Object.keys(updateFields).forEach((key) => {
+      if (key.startsWith('$') || key.includes('.')) {
+        delete updateFields[key];
+      }
+    });
+
+    if (updateFields.coverImage && !isSafeExternalHttpsUrl(updateFields.coverImage)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Cover image must be a valid external HTTPS URL.'
+      });
+    }
+
     updateFields.updatedAt = new Date();
 
     if (updateFields.featured !== undefined) {
@@ -1630,10 +1751,12 @@ app.post('/api/admin/revoke-admin', verifyAdminToken, async (req, res) => {
 });
 
 // POST /api/admin/bootstrap: Initial setup if NO admins exist anywhere in database
-app.post('/api/admin/bootstrap', async (req, res) => {
+app.post('/api/admin/bootstrap', verifyUserToken, async (req, res) => {
   try {
     const totalAdmins = await adminsCollection.countDocuments();
-    const totalAdminUsers = await usersCollection.countDocuments({ role: 'admin' });
+    const totalAdminUsers = await usersCollection.countDocuments({
+      role: { $in: ['admin', 'superadmin'] }
+    });
 
     if (totalAdmins > 0 || totalAdminUsers > 0) {
       return res.status(403).json({
@@ -1681,8 +1804,8 @@ app.post('/api/admin/bootstrap', async (req, res) => {
   }
 });
 
-// POST /api/seed: Manual trigger to re-seed initial data
-app.post('/api/seed', async (req, res) => {
+// POST /api/seed: Manual trigger to re-seed initial data (Protected: Admin only)
+app.post('/api/seed', verifyAdminToken, async (req, res) => {
   try {
     await categoriesCollection.deleteMany({});
     await categoriesCollection.insertMany(
@@ -1729,6 +1852,14 @@ app.get('/api/health', (req, res) => {
     status: 'online',
     timestamp: new Date(),
     database: db ? 'connected' : 'disconnected'
+  });
+});
+
+// Catch-all 404 handler for unknown /api/* routes (prevents enumeration leakage)
+app.use('/api/*', (req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'API endpoint not found.'
   });
 });
 
